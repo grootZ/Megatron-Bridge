@@ -30,6 +30,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -300,6 +301,13 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
+        # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
+        if self.config.enable_mhc_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -514,6 +522,14 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
+            # Pipeline schedules may prepare a later microbatch before this checkpoint
+            # replays. Keep each layer's PLE inputs with its own checkpoint closure.
+            ple_states = {}
+            for index in range(start, end):
+                ple = getattr(self._get_layer(index), "per_layer_embedding", None)
+                if ple is not None:
+                    ple_states[index] = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
+
             def custom_forward(
                 hidden_states,
                 attention_mask,
@@ -527,32 +543,40 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                 deepstack_visual_embeds = list(deepstack_visual_embeds_args) if deepstack_visual_embeds_args else None
                 for index in range(start, end):
                     layer = self._get_layer(index)
+                    ple = getattr(layer, "per_layer_embedding", None)
+                    if ple is not None:
+                        previous_ple_state = (ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params)
+                        ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = ple_states[index]
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
                         else nullcontext()
                     )
-                    with inner_fp8_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            inference_context=None,
-                            packed_seq_params=packed_seq_params,
-                            padding_mask=padding_mask,
-                        )
+                    try:
+                        with inner_fp8_context:
+                            hidden_states, context = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                context=context,
+                                context_mask=context_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                attention_bias=attention_bias,
+                                inference_context=None,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
 
-                        if self.pre_process and deepstack_visual_embeds is not None:
-                            l_no = layer.layer_number - 1
-                            if l_no in range(len(deepstack_visual_embeds)):
-                                hidden_states = self._deepstack_process(
-                                    hidden_states,
-                                    visual_pos_masks,
-                                    deepstack_visual_embeds[l_no],
-                                )
+                            if self.pre_process and deepstack_visual_embeds is not None:
+                                l_no = layer.layer_number - 1
+                                if l_no in range(len(deepstack_visual_embeds)):
+                                    hidden_states = self._deepstack_process(
+                                        hidden_states,
+                                        visual_pos_masks,
+                                        deepstack_visual_embeds[l_no],
+                                    )
+                    finally:
+                        if ple is not None:
+                            ple._ngram_ids, ple._position_in_sequence, ple._cp_packed_seq_params = previous_ple_state
                 return hidden_states, context
 
             return custom_forward
@@ -714,6 +738,13 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # Hyper connections (e.g. Qwen4-Exp gated residual): expand the single stream to
+        # n streams at the block start, mirroring megatron.core TransformerBlock.forward.
+        if self.config.enable_mhc_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -785,6 +816,11 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # MTP's gated-residual branch consumes the full residual-stream tensor;
+        # the main LM head still consumes the contracted output below.
+        if self.config.mtp_num_layers and self.post_process and self.config.enable_mhc_connections:
+            self._mtp_multistream = hidden_states
 
         # Final layer norm.
         if self.final_layernorm is not None:

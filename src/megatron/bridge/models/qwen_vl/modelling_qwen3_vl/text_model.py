@@ -78,6 +78,8 @@ class Qwen3VLGPTModel(GPTModel):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
+        mtp_layer_pattern: Optional[str] = None,
+        mtp_hybrid_submodules: Optional[object] = None,
         vp_stage: Optional[int] = None,
         pg_collection: ProcessGroupCollection = None,
     ) -> None:
@@ -100,6 +102,8 @@ class Qwen3VLGPTModel(GPTModel):
             scatter_embedding_sequence_parallel=scatter_embedding_sequence_parallel,
             seq_len_interpolation_factor=seq_len_interpolation_factor,
             mtp_block_spec=mtp_block_spec,
+            mtp_layer_pattern=mtp_layer_pattern,
+            mtp_hybrid_submodules=mtp_hybrid_submodules,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
         )
@@ -167,6 +171,7 @@ class Qwen3VLGPTModel(GPTModel):
         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
         output_processor: Callable[..., Tensor] | None = None,
         output_processor_context: Any | None = None,
+        mtp_kwargs: dict[str, Tensor] | None = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -189,6 +194,31 @@ class Qwen3VLGPTModel(GPTModel):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        mtp_input_mask = None
+        if mtp_kwargs is not None:
+            if labels is not None:
+                raise ValueError("Pass either main-loss labels or mtp_kwargs, not both")
+            if set(mtp_kwargs) != {"mtp_labels", "mtp_input_mask"}:
+                raise ValueError("mtp_kwargs must contain mtp_labels and mtp_input_mask")
+            labels = mtp_kwargs["mtp_labels"]
+            mtp_input_mask = mtp_kwargs["mtp_input_mask"]
+
+            # MCore needs labels to compute its auxiliary MTP loss. Relax computes
+            # the main SFT loss externally from logits, so bypass the internal CE.
+            original_output_processor = output_processor
+
+            def _mtp_logits_processor(**processor_kwargs):
+                if original_output_processor is not None:
+                    processor_kwargs["labels"] = None
+                    return original_output_processor(**processor_kwargs)
+                logits, _ = processor_kwargs["output_layer"](
+                    processor_kwargs["hidden_states"],
+                    weight=processor_kwargs["output_weight"],
+                    runtime_gather_output=processor_kwargs["runtime_gather_output"],
+                )
+                return processor_kwargs["scale_logits"](logits).transpose(0, 1).contiguous()
+
+            output_processor = _mtp_logits_processor
 
         # `_preprocess` can optionally return an extra fused cos/sin buffer (for
         # flash decode). Match the upstream GPTModel handling to avoid unpack
@@ -211,6 +241,11 @@ class Qwen3VLGPTModel(GPTModel):
         ) = preproc_output[:5]
         if len(preproc_output) > 5:
             padding_mask = preproc_output[5]
+
+        # Per-layer (hashed n-gram) embeddings (Qwen4-Exp PLE) need the raw token ids
+        # prepared before the decoder runs — mirror the base GPTModel.forward.
+        if self.config.ple_layer_ids:
+            self._prepare_per_layer_embeddings(input_ids, packed_seq_params, inference_context)
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -250,6 +285,9 @@ class Qwen3VLGPTModel(GPTModel):
         postprocess_packed_seq_params = (
             _get_mtp_packed_seq_params(packed_seq_params) if self.mtp_process else packed_seq_params
         )
+        mhc_multistream = getattr(self.decoder, "_mtp_multistream", None)
+        if mhc_multistream is not None:
+            del self.decoder._mtp_multistream
         result = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -271,6 +309,8 @@ class Qwen3VLGPTModel(GPTModel):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            mtp_input_mask=mtp_input_mask,
+            **({"mhc_multistream": mhc_multistream} if mhc_multistream is not None else {}),
         )
 
         if _shadow_embedding:

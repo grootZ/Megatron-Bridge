@@ -13,7 +13,10 @@
 # limitations under the License.
 
 from megatron.bridge.models.exaone.exaone4 import Exaone4Bridge
-from megatron.bridge.models.exaone.exaone45 import Exaone45Bridge, Exaone45Model, Exaone45ModelProvider
+try:
+    from megatron.bridge.models.exaone.exaone45 import Exaone45Bridge, Exaone45Model, Exaone45ModelProvider
+except ImportError:  # pragma: no cover - needs transformers.Exaone4_5_ForConditionalGeneration
+    Exaone45Bridge = Exaone45Model = Exaone45ModelProvider = None
 from megatron.bridge.models.exaone.exaone_moe import ExaoneMoeBridge, ExaoneMoeModelProvider
 
 

@@ -43,11 +43,21 @@ from megatron.bridge.models.ernie_vl import (
 from megatron.bridge.models.exaone.exaone4 import (
     Exaone4Bridge,
 )
-from megatron.bridge.models.exaone.exaone45 import (
-    Exaone45Bridge,
-    Exaone45Model,
-    Exaone45ModelProvider,
-)
+# Exaone 4.5 needs `transformers.Exaone4_5_ForConditionalGeneration`, which only
+# exists on newer transformers (absent on 5.3.0). Keep it optional so a stale
+# transformers does not take the whole bridge registry -- and with it every
+# AutoBridge user -- down with it.
+try:
+    from megatron.bridge.models.exaone.exaone45 import (
+        Exaone45Bridge,
+        Exaone45Model,
+        Exaone45ModelProvider,
+    )
+except ImportError as _exaone45_import_error:  # pragma: no cover - env dependent
+    import warnings as _warnings
+
+    _warnings.warn(f"Exaone 4.5 bridge unavailable: {_exaone45_import_error}")
+    Exaone45Bridge = Exaone45Model = Exaone45ModelProvider = None
 from megatron.bridge.models.exaone.exaone_moe import (
     ExaoneMoeBridge,
     ExaoneMoeModelProvider,
